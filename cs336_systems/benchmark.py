@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 # Import the model from cs336_basics
 # Note: cs336_basics is a dependency declared in pyproject.toml
@@ -102,7 +103,7 @@ def run_benchmark(
         device: Device being used
     
     Returns:
-        Dictionary with timing results
+        Dictionary with timing results including mean and std dev
     """
     print(f"\nRunning {num_warmup} warmup steps...")
     for _ in range(num_warmup):
@@ -110,22 +111,28 @@ def run_benchmark(
     
     print(f"Running {num_steps} timed steps...")
     
-    # Use timeit.default_timer() for high-resolution timing
-    start_time = timeit.default_timer()
+    # Track individual step times
+    step_times = []
     
     for _ in range(num_steps):
+        step_start = timeit.default_timer()
         benchmark_step(model, batch, include_backward, device)
+        step_end = timeit.default_timer()
+        step_times.append(step_end - step_start)
     
-    end_time = timeit.default_timer()
-    
-    total_time = end_time - start_time
-    avg_time = total_time / num_steps
+    # Calculate statistics
+    step_times_array = np.array(step_times)
+    total_time = np.sum(step_times_array)
+    avg_time = np.mean(step_times_array)
+    std_time = np.std(step_times_array)
     
     return {
         "total_time": total_time,
         "avg_time": avg_time,
+        "std_time": std_time,
         "num_steps": num_steps,
-        "throughput": num_steps / total_time  # steps per second
+        "throughput": num_steps / total_time,  # steps per second
+        "step_times": step_times_array
     }
 
 
@@ -286,6 +293,9 @@ def main():
     print(f"\nTotal time: {results['total_time']:.4f} seconds")
     print(f"Average time per step: {results['avg_time']:.4f} seconds")
     print(f"Average time per step: {results['avg_time'] * 1000:.2f} ms")
+    print(f"Standard deviation: {results['std_time']:.4f} seconds")
+    print(f"Standard deviation: {results['std_time'] * 1000:.2f} ms")
+    print(f"Coefficient of variation: {(results['std_time'] / results['avg_time'] * 100):.2f}%")
     print(f"Throughput: {results['throughput']:.2f} steps/second")
     
     # Calculate tokens per second
