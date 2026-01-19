@@ -172,6 +172,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'cs336-basics'))
 from cs336_basics.model import BasicsTransformerLM  # type: ignore[import-not-found]
+from cs336_basics.optimizer import AdamW  # type: ignore[import-not-found]
 
 
 def create_random_batch(
@@ -203,7 +204,8 @@ def benchmark_step(
     batch: torch.Tensor,
     include_backward: bool = False,
     device: str = "cpu",
-    step_idx: int = 0
+    step_idx: int = 0,
+    optimizer: Optional[torch.optim.Optimizer] = None
 ) -> None:
     """Run a single benchmark step (forward and optionally backward pass).
     
@@ -213,6 +215,7 @@ def benchmark_step(
         include_backward: Whether to include backward pass
         device: Device being used
         step_idx: Step index for NVTX annotation
+        optimizer: Optimizer to use for parameter updates (if provided)
     """
     # Forward pass
     phase_label = f" ({_profiling_phase})" if _profiling_phase else ""
@@ -231,9 +234,17 @@ def benchmark_step(
         with nvtx.range(f"Backward Pass{phase_label} (step {step_idx})"):
             loss.backward()
         
+        # Optimizer step if provided
+        if optimizer is not None:
+            with nvtx.range(f"Optimizer Step{phase_label} (step {step_idx})"):
+                optimizer.step()
+        
         # Zero gradients for next iteration
         with nvtx.range(f"Zero Grad{phase_label} (step {step_idx})"):
-            model.zero_grad()
+            if optimizer is not None:
+                optimizer.zero_grad()
+            else:
+                model.zero_grad()
     
     # Synchronize CUDA if using GPU
     if device.startswith("cuda") or device == "gpu":
@@ -246,7 +257,8 @@ def run_benchmark(
     num_steps: int,
     num_warmup: int,
     include_backward: bool,
-    device: str
+    device: str,
+    optimizer: Optional[torch.optim.Optimizer] = None
 ) -> dict:
     """Run the full benchmark with warmup and timing.
     
@@ -269,7 +281,7 @@ def run_benchmark(
     with nvtx.range("Warmup Steps"):
         for i in range(num_warmup):
             with nvtx.range(f"Warmup Step {i}"):
-                benchmark_step(model, batch, include_backward, device, step_idx=i)
+                benchmark_step(model, batch, include_backward, device, step_idx=i, optimizer=optimizer)
     
     print(f"Running {num_steps} timed steps...")
     
@@ -282,7 +294,7 @@ def run_benchmark(
         for i in range(num_steps):
             step_start = timeit.default_timer()
             with nvtx.range(f"Benchmark Step {i}"):
-                benchmark_step(model, batch, include_backward, device, step_idx=i)
+                benchmark_step(model, batch, include_backward, device, step_idx=i, optimizer=optimizer)
             step_end = timeit.default_timer()
             step_times.append(step_end - step_start)
     
@@ -375,6 +387,10 @@ def main():
         "--detailed-profile", action="store_true",
         help="Enable detailed NVTX profiling with per-layer annotations for attention, FFN, and LayerNorm"
     )
+    parser.add_argument(
+        "--optimizer", action="store_true",
+        help="Include AdamW optimizer step in the benchmark (requires --backward)"
+    )
     
     args = parser.parse_args()
     
@@ -411,9 +427,15 @@ def main():
     print(f"  Warmup Steps: {args.num_warmup}")
     print(f"  Timed Steps: {args.num_steps}")
     print(f"  Include Backward: {args.backward}")
+    print(f"  Include Optimizer: {args.optimizer}")
     print(f"  Device: {device}")
     print(f"  Random Seed: {args.seed}")
     print(f"  Detailed Profiling: {args.detailed_profile}")
+    
+    # Validate optimizer flag
+    if args.optimizer and not args.backward:
+        print("Warning: --optimizer requires --backward, enabling backward pass")
+        args.backward = True
     
     # Initialize model
     print("\nInitializing model...")
@@ -444,6 +466,19 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {num_params:,} ({num_params / 1e6:.2f}M)")
     
+    # Initialize optimizer if requested
+    optimizer = None
+    if args.optimizer:
+        print("\nInitializing AdamW optimizer...")
+        optimizer = AdamW(
+            model.parameters(),
+            lr=1e-4,  # Default learning rate
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01
+        )
+        print(f"Optimizer: AdamW (lr=1e-4, betas=(0.9, 0.999), weight_decay=0.01)")
+    
     # Generate random batch
     print("\nGenerating random batch...")
     batch = create_random_batch(
@@ -460,7 +495,8 @@ def main():
         num_steps=args.num_steps,
         num_warmup=args.num_warmup,
         include_backward=args.backward,
-        device=device
+        device=device,
+        optimizer=optimizer
     )
     
     # Print results
