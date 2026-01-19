@@ -17,6 +17,141 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+# Import NVTX for profiling annotations
+try:
+    import torch.cuda.nvtx as nvtx  # type: ignore
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    # Provide no-op context manager if NVTX not available
+    class nvtx:  # type: ignore
+        @staticmethod
+        def range(msg):
+            class DummyContext:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+            return DummyContext()
+
+
+class InstrumentedAttention(nn.Module):
+    """
+    Wrapper to add NVTX annotations to attention layers.
+    
+    This allows you to see which specific attention operations are taking time.
+    """
+    
+    def __init__(self, attention_module, layer_idx: int = 0):
+        super().__init__()
+        self.attention = attention_module
+        self.layer_idx = layer_idx
+    
+    def forward(self, x, *args, **kwargs):
+        with nvtx.range(f"Layer {self.layer_idx} - Attention"):
+            output = self.attention(x, *args, **kwargs)
+        return output
+
+
+class InstrumentedFFN(nn.Module):
+    """
+    Wrapper to add NVTX annotations to feed-forward layers.
+    """
+    
+    def __init__(self, ffn_module, layer_idx: int = 0):
+        super().__init__()
+        self.ffn = ffn_module
+        self.layer_idx = layer_idx
+    
+    def forward(self, x):
+        with nvtx.range(f"Layer {self.layer_idx} - FFN"):
+            output = self.ffn(x)
+        return output
+
+
+class InstrumentedLayerNorm(nn.Module):
+    """
+    Wrapper to add NVTX annotations to LayerNorm operations.
+    """
+    
+    def __init__(self, ln_module, layer_idx: int = 0, position: str = ""):
+        super().__init__()
+        self.ln = ln_module
+        self.layer_idx = layer_idx
+        self.position = position
+    
+    def forward(self, x):
+        label = f"Layer {self.layer_idx} - LayerNorm"
+        if self.position:
+            label += f" ({self.position})"
+        with nvtx.range(label):
+            output = self.ln(x)
+        return output
+
+
+def instrument_transformer_model(model):
+    """
+    Add detailed NVTX annotations to a transformer model's layers.
+    
+    This function wraps attention, FFN, and LayerNorm layers with NVTX ranges
+    so you can see their individual contributions in the profiler.
+    
+    Args:
+        model: A transformer model (e.g., BasicsTransformerLM)
+    
+    Returns:
+        The instrumented model
+    """
+    if not NVTX_AVAILABLE:
+        print("Warning: NVTX not available, model will not be instrumented")
+        return model
+    
+    print("Instrumenting model with detailed NVTX annotations...")
+    
+    # Try different common attribute names for transformer layers
+    layers_attr = None
+    for attr_name in ['layers', 'transformer_layers', 'blocks', 'h']:
+        if hasattr(model, attr_name):
+            layers_attr = attr_name
+            break
+    
+    if layers_attr is None:
+        print(f"Warning: Could not find transformer layers in model. "
+              f"Model attributes: {dir(model)}")
+        return model
+    
+    layers = getattr(model, layers_attr)
+    num_instrumented = 0
+    
+    for i, layer in enumerate(layers):
+        # Instrument attention modules
+        for attn_name in ['attention', 'self_attn', 'attn']:
+            if hasattr(layer, attn_name):
+                attn = getattr(layer, attn_name)
+                if attn is not None and not isinstance(attn, InstrumentedAttention):
+                    setattr(layer, attn_name, InstrumentedAttention(attn, i))
+                    num_instrumented += 1
+                break
+        
+        # Instrument FFN/MLP modules
+        for ffn_name in ['ffn', 'mlp', 'feed_forward']:
+            if hasattr(layer, ffn_name):
+                ffn = getattr(layer, ffn_name)
+                if ffn is not None and not isinstance(ffn, InstrumentedFFN):
+                    setattr(layer, ffn_name, InstrumentedFFN(ffn, i))
+                    num_instrumented += 1
+                break
+        
+        # Instrument LayerNorm modules
+        for ln_name, position in [('ln_1', 'pre-attn'), ('ln_2', 'pre-ffn'), 
+                                   ('norm1', 'pre-attn'), ('norm2', 'pre-ffn')]:
+            if hasattr(layer, ln_name):
+                ln = getattr(layer, ln_name)
+                if ln is not None and not isinstance(ln, InstrumentedLayerNorm):
+                    setattr(layer, ln_name, InstrumentedLayerNorm(ln, i, position))
+                    num_instrumented += 1
+    
+    print(f"Instrumented {num_instrumented} modules across {len(layers)} layers")
+    return model
+
 # Import the model from cs336_basics
 # Note: cs336_basics is a dependency declared in pyproject.toml
 # Run with: uv run python3 -m cs336_systems.benchmark
@@ -54,7 +189,8 @@ def benchmark_step(
     model: nn.Module,
     batch: torch.Tensor,
     include_backward: bool = False,
-    device: str = "cpu"
+    device: str = "cpu",
+    step_idx: int = -1
 ) -> None:
     """Run a single benchmark step (forward and optionally backward pass).
     
@@ -63,21 +199,27 @@ def benchmark_step(
         batch: Input batch
         include_backward: Whether to include backward pass
         device: Device being used
+        step_idx: Step index for NVTX annotation (-1 for no annotation)
     """
     # Forward pass
-    logits = model(batch)
+    with nvtx.range(f"Forward Pass (step {step_idx})" if step_idx >= 0 else "Forward Pass"):
+        logits = model(batch)
     
     if include_backward:
         # Compute a simple loss and backward pass
         # Using a dummy target (same as input for simplicity)
-        loss = nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            batch.view(-1)
-        )
-        loss.backward()
+        with nvtx.range(f"Loss Computation (step {step_idx})" if step_idx >= 0 else "Loss Computation"):
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                batch.view(-1)
+            )
+        
+        with nvtx.range(f"Backward Pass (step {step_idx})" if step_idx >= 0 else "Backward Pass"):
+            loss.backward()
         
         # Zero gradients for next iteration
-        model.zero_grad()
+        with nvtx.range(f"Zero Grad (step {step_idx})" if step_idx >= 0 else "Zero Grad"):
+            model.zero_grad()
     
     # Synchronize CUDA if using GPU
     if device.startswith("cuda") or device == "gpu":
@@ -106,19 +248,25 @@ def run_benchmark(
         Dictionary with timing results including mean and std dev
     """
     print(f"\nRunning {num_warmup} warmup steps...")
-    for _ in range(num_warmup):
-        benchmark_step(model, batch, include_backward, device)
+    # Mark warmup steps with NVTX so they can be filtered out in the profiler
+    with nvtx.range("Warmup Steps"):
+        for i in range(num_warmup):
+            with nvtx.range(f"Warmup Step {i}"):
+                benchmark_step(model, batch, include_backward, device, step_idx=-1)
     
     print(f"Running {num_steps} timed steps...")
     
     # Track individual step times
     step_times = []
     
-    for _ in range(num_steps):
-        step_start = timeit.default_timer()
-        benchmark_step(model, batch, include_backward, device)
-        step_end = timeit.default_timer()
-        step_times.append(step_end - step_start)
+    # Mark timed steps with NVTX
+    with nvtx.range("Timed Steps"):
+        for i in range(num_steps):
+            step_start = timeit.default_timer()
+            with nvtx.range(f"Benchmark Step {i}"):
+                benchmark_step(model, batch, include_backward, device, step_idx=i)
+            step_end = timeit.default_timer()
+            step_times.append(step_end - step_start)
     
     # Calculate statistics
     step_times_array = np.array(step_times)
@@ -203,6 +351,10 @@ def main():
         "--seed", type=int, default=42,
         help="Random seed (default: 42)"
     )
+    parser.add_argument(
+        "--detailed-profile", action="store_true",
+        help="Enable detailed NVTX profiling with per-layer annotations for attention, FFN, and LayerNorm"
+    )
     
     args = parser.parse_args()
     
@@ -241,6 +393,7 @@ def main():
     print(f"  Include Backward: {args.backward}")
     print(f"  Device: {device}")
     print(f"  Random Seed: {args.seed}")
+    print(f"  Detailed Profiling: {args.detailed_profile}")
     
     # Initialize model
     print("\nInitializing model...")
@@ -253,6 +406,10 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
     )
+    
+    # Apply detailed profiling instrumentation if requested
+    if args.detailed_profile:
+        model = instrument_transformer_model(model)
     
     # Move model to device
     model = model.to(device)
