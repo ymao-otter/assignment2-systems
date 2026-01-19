@@ -33,6 +33,11 @@ except ImportError:
             return DummyContext()
 
 
+# Global variable to track profiling phase (warmup vs timed)
+# This allows detailed layer annotations to distinguish between phases
+_profiling_phase = ""
+
+
 class InstrumentedAttention(nn.Module):
     """
     Wrapper to add NVTX annotations to attention layers.
@@ -46,7 +51,10 @@ class InstrumentedAttention(nn.Module):
         self.layer_idx = layer_idx
     
     def forward(self, x, *args, **kwargs):
-        with nvtx.range(f"Layer {self.layer_idx} - Attention"):
+        label = f"Layer {self.layer_idx} - Attention"
+        if _profiling_phase:
+            label = f"{label} ({_profiling_phase})"
+        with nvtx.range(label):
             output = self.attention(x, *args, **kwargs)
         return output
 
@@ -62,7 +70,10 @@ class InstrumentedFFN(nn.Module):
         self.layer_idx = layer_idx
     
     def forward(self, x):
-        with nvtx.range(f"Layer {self.layer_idx} - FFN"):
+        label = f"Layer {self.layer_idx} - FFN"
+        if _profiling_phase:
+            label = f"{label} ({_profiling_phase})"
+        with nvtx.range(label):
             output = self.ffn(x)
         return output
 
@@ -82,6 +93,8 @@ class InstrumentedLayerNorm(nn.Module):
         label = f"Layer {self.layer_idx} - LayerNorm"
         if self.position:
             label += f" ({self.position})"
+        if _profiling_phase:
+            label = f"{label} [{_profiling_phase}]"
         with nvtx.range(label):
             output = self.ln(x)
         return output
@@ -190,7 +203,7 @@ def benchmark_step(
     batch: torch.Tensor,
     include_backward: bool = False,
     device: str = "cpu",
-    step_idx: int = -1
+    step_idx: int = 0
 ) -> None:
     """Run a single benchmark step (forward and optionally backward pass).
     
@@ -199,26 +212,27 @@ def benchmark_step(
         batch: Input batch
         include_backward: Whether to include backward pass
         device: Device being used
-        step_idx: Step index for NVTX annotation (-1 for no annotation)
+        step_idx: Step index for NVTX annotation
     """
     # Forward pass
-    with nvtx.range(f"Forward Pass (step {step_idx})" if step_idx >= 0 else "Forward Pass"):
+    phase_label = f" ({_profiling_phase})" if _profiling_phase else ""
+    with nvtx.range(f"Forward Pass{phase_label} (step {step_idx})"):
         logits = model(batch)
     
     if include_backward:
         # Compute a simple loss and backward pass
         # Using a dummy target (same as input for simplicity)
-        with nvtx.range(f"Loss Computation (step {step_idx})" if step_idx >= 0 else "Loss Computation"):
+        with nvtx.range(f"Loss Computation{phase_label} (step {step_idx})"):
             loss = nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 batch.view(-1)
             )
         
-        with nvtx.range(f"Backward Pass (step {step_idx})" if step_idx >= 0 else "Backward Pass"):
+        with nvtx.range(f"Backward Pass{phase_label} (step {step_idx})"):
             loss.backward()
         
         # Zero gradients for next iteration
-        with nvtx.range(f"Zero Grad (step {step_idx})" if step_idx >= 0 else "Zero Grad"):
+        with nvtx.range(f"Zero Grad{phase_label} (step {step_idx})"):
             model.zero_grad()
     
     # Synchronize CUDA if using GPU
@@ -247,12 +261,15 @@ def run_benchmark(
     Returns:
         Dictionary with timing results including mean and std dev
     """
+    global _profiling_phase
+    
     print(f"\nRunning {num_warmup} warmup steps...")
     # Mark warmup steps with NVTX so they can be filtered out in the profiler
+    _profiling_phase = "warmup"
     with nvtx.range("Warmup Steps"):
         for i in range(num_warmup):
             with nvtx.range(f"Warmup Step {i}"):
-                benchmark_step(model, batch, include_backward, device, step_idx=-1)
+                benchmark_step(model, batch, include_backward, device, step_idx=i)
     
     print(f"Running {num_steps} timed steps...")
     
@@ -260,6 +277,7 @@ def run_benchmark(
     step_times = []
     
     # Mark timed steps with NVTX
+    _profiling_phase = "timed"
     with nvtx.range("Timed Steps"):
         for i in range(num_steps):
             step_start = timeit.default_timer()
@@ -267,6 +285,8 @@ def run_benchmark(
                 benchmark_step(model, batch, include_backward, device, step_idx=i)
             step_end = timeit.default_timer()
             step_times.append(step_end - step_start)
+    
+    _profiling_phase = ""
     
     # Calculate statistics
     step_times_array = np.array(step_times)
