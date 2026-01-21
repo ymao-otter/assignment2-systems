@@ -12,6 +12,7 @@ This script supports:
 import argparse
 import timeit
 from typing import Optional
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -205,7 +206,8 @@ def benchmark_step(
     include_backward: bool = False,
     device: str = "cpu",
     step_idx: int = 0,
-    optimizer: Optional[torch.optim.Optimizer] = None
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    autocast_context = None
 ) -> None:
     """Run a single benchmark step (forward and optionally backward pass).
     
@@ -216,20 +218,23 @@ def benchmark_step(
         device: Device being used
         step_idx: Step index for NVTX annotation
         optimizer: Optimizer to use for parameter updates (if provided)
+        autocast_context: Autocast context manager for mixed precision (or nullcontext)
     """
     # Forward pass
     phase_label = f" ({_profiling_phase})" if _profiling_phase else ""
-    with nvtx.range(f"Forward Pass{phase_label} (step {step_idx})"):
-        logits = model(batch)
+    with autocast_context:
+        with nvtx.range(f"Forward Pass{phase_label} (step {step_idx})"):
+            logits = model(batch)
     
     if include_backward:
         # Compute a simple loss and backward pass
         # Using a dummy target (same as input for simplicity)
-        with nvtx.range(f"Loss Computation{phase_label} (step {step_idx})"):
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                batch.view(-1)
-            )
+        with autocast_context:
+            with nvtx.range(f"Loss Computation{phase_label} (step {step_idx})"):
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    batch.view(-1)
+                )
         
         with nvtx.range(f"Backward Pass{phase_label} (step {step_idx})"):
             loss.backward()
@@ -258,7 +263,8 @@ def run_benchmark(
     num_warmup: int,
     include_backward: bool,
     device: str,
-    optimizer: Optional[torch.optim.Optimizer] = None
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    autocast_context = None
 ) -> dict:
     """Run the full benchmark with warmup and timing.
     
@@ -269,6 +275,8 @@ def run_benchmark(
         num_warmup: Number of warmup steps
         include_backward: Whether to include backward pass
         device: Device being used
+        optimizer: Optimizer to use for parameter updates (if provided)
+        autocast_context: Autocast context manager for mixed precision (or nullcontext)
     
     Returns:
         Dictionary with timing results including mean and std dev
@@ -281,7 +289,7 @@ def run_benchmark(
     with nvtx.range("Warmup Steps"):
         for i in range(num_warmup):
             with nvtx.range(f"Warmup Step {i}"):
-                benchmark_step(model, batch, include_backward, device, step_idx=i, optimizer=optimizer)
+                benchmark_step(model, batch, include_backward, device, step_idx=i, optimizer=optimizer, autocast_context=autocast_context)
     
     print(f"Running {num_steps} timed steps...")
     
@@ -294,7 +302,7 @@ def run_benchmark(
         for i in range(num_steps):
             step_start = timeit.default_timer()
             with nvtx.range(f"Benchmark Step {i}"):
-                benchmark_step(model, batch, include_backward, device, step_idx=i, optimizer=optimizer)
+                benchmark_step(model, batch, include_backward, device, step_idx=i, optimizer=optimizer, autocast_context=autocast_context)
             step_end = timeit.default_timer()
             step_times.append(step_end - step_start)
     
@@ -391,6 +399,10 @@ def main():
         "--optimizer", action="store_true",
         help="Include AdamW optimizer step in the benchmark (requires --backward)"
     )
+    parser.add_argument(
+        "--mixed-precision", action="store_true",
+        help="Use mixed precision training with BF16 autocast"
+    )
     
     args = parser.parse_args()
     
@@ -428,6 +440,7 @@ def main():
     print(f"  Timed Steps: {args.num_steps}")
     print(f"  Include Backward: {args.backward}")
     print(f"  Include Optimizer: {args.optimizer}")
+    print(f"  Mixed Precision (BF16): {args.mixed_precision}")
     print(f"  Device: {device}")
     print(f"  Random Seed: {args.seed}")
     print(f"  Detailed Profiling: {args.detailed_profile}")
@@ -488,6 +501,17 @@ def main():
         device=device
     )
     
+    # Create autocast context for mixed precision or nullcontext for full precision
+    if args.mixed_precision:
+        if device.startswith("cuda"):
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            print("\nUsing BF16 mixed precision training")
+        else:
+            print("\nWarning: Mixed precision requested but not available on CPU, using full precision")
+            autocast_ctx = nullcontext()
+    else:
+        autocast_ctx = nullcontext()
+    
     # Run benchmark
     results = run_benchmark(
         model=model,
@@ -496,7 +520,8 @@ def main():
         num_warmup=args.num_warmup,
         include_backward=args.backward,
         device=device,
-        optimizer=optimizer
+        optimizer=optimizer,
+        autocast_context=autocast_ctx
     )
     
     # Print results
