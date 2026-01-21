@@ -28,9 +28,24 @@ Mixed precision training with BF16 provides consistent speedups of 1.45-1.65x ac
 - Hardware: NVIDIA GPU with CUDA
 - Implementation: PyTorch `torch.autocast` with `dtype=torch.bfloat16`
 
+## LayerNorm in Mixed Precision
+
+**Question:** What parts of layer normalization are sensitive to mixed precision? Do we still need to treat LayerNorm differently with BF16 vs FP16?
+
+**Answer:** Layer normalization is sensitive to mixed precision because it involves variance computation (squaring and summing values), division by the square root of variance, and mean-variance subtractions, all of which can accumulate numerical errors or encounter underflow/overflow in reduced precision. PyTorch's autocast keeps LayerNorm in FP32 for **both FP16 and BF16**, because while BF16's wider dynamic range (same as FP32) prevents the overflow/underflow issues that plague FP16, its reduced mantissa precision (7 bits vs FP32's 23 bits) can still cause accuracy degradation in the sensitive variance and normalization calculations. The normalization operation is fundamentally more precision-sensitive than matrix multiplications, requiring the full FP32 precision to maintain training stability regardless of which reduced-precision format is used.
+
+**Experimental Verification:**
+- Tested LayerNorm with FP16, BF16, and FP32 autocast
+- Result: **Both FP16 and BF16 autocast keep LayerNorm in FP32**
+- Linear layers use reduced precision, but normalization stays FP32
+
+**Key Insight:** BF16 solves the dynamic **range** problem but not the **precision** problem for LayerNorm.
+
 ## Files
 
 - `benchmark.py` - Modified benchmark script with `--mixed-precision` flag
 - `mixed_precision_training_analysis.md` - Detailed analysis
+- `layernorm_mixed_precision_analysis.md` - LayerNorm sensitivity analysis
 - `mixed_precision_results.json` - Raw benchmark data
 - `run_focused_comparison.py` - Automated comparison script
+- `test_layernorm_precision.py` - LayerNorm dtype verification script
