@@ -55,11 +55,48 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
     import sys
     import os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from cs336_systems.ddp import DDPIndividualParameters
-    return DDPIndividualParameters(module)
+    from cs336_systems.ddp import DDPIndividualParametersOverlapped
+    return DDPIndividualParametersOverlapped(module)
 
 
 def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """
+    Code to run after the backward pass is completed, but before we take
+    an optimizer step.
+
+    Args:
+        ddp_model: torch.nn.Module
+            DDP-wrapped model.
+        optimizer: torch.optim.Optimizer
+            Optimizer being used with the DDP-wrapped model.
+    """
+    ddp_model.finish_gradient_synchronization()
+
+
+def get_ddp_flattened_gradients(module: torch.nn.Module) -> torch.nn.Module:
+    """
+    Returns a torch.nn.Module container that handles
+    parameter broadcasting and gradient synchronization for
+    distributed data parallel training.
+
+    This container flattens all gradients into a single tensor
+    before performing a single all-reduce operation, reducing
+    communication overhead compared to individual parameter synchronization.
+
+    Args:
+        module: torch.nn.Module
+            Underlying model to wrap with DDP.
+    Returns:
+        Instance of a DDP class.
+    """
+    import sys
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from cs336_systems.ddp import DDPFlattenedGradients
+    return DDPFlattenedGradients(module)
+
+
+def ddp_flattened_gradients_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     """
     Code to run after the backward pass is completed, but before we take
     an optimizer step.

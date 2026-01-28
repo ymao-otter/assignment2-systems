@@ -58,10 +58,10 @@ def train_ddp(rank: int, world_size: int, num_steps: int = 10):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
-    from cs336_systems.ddp import DDPIndividualParameters
+    from cs336_systems.ddp import DDPIndividualParametersOverlapped
     
     # Wrap with DDP
-    ddp_model = DDPIndividualParameters(ddp_base)
+    ddp_model = DDPIndividualParametersOverlapped(ddp_base)
     
     # Generate random training data (same across all ranks)
     torch.manual_seed(42)
