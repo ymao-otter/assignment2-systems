@@ -250,3 +250,196 @@ class DDPFlattenedGradients(nn.Module):
     def forward(self, *args, **kwargs):
         """Forward pass through the wrapped module."""
         return self.module(*args, **kwargs)
+
+
+class DDPBucketed(nn.Module):
+    """
+    A DDP implementation that uses gradient bucketing with computation-communication overlap.
+    
+    This implementation combines both key optimizations:
+    1. Gradient bucketing: Groups parameters into buckets to reduce number of all-reduce calls
+    2. Computation overlap: Triggers all-reduce as soon as a bucket is ready during backward pass
+    
+    This is similar to PyTorch's official DDP implementation.
+    
+    Args:
+        module: The underlying model to wrap with DDP
+        bucket_size_mb: Maximum size of each bucket in megabytes
+    """
+    
+    def __init__(self, module: nn.Module, bucket_size_mb: float):
+        super().__init__()
+        self.module = module
+        self.bucket_size_mb = bucket_size_mb
+        
+        # Broadcast parameters from rank 0 to all other ranks
+        self._broadcast_parameters()
+        
+        # Create buckets and register hooks
+        self._create_buckets()
+        self._register_gradient_hooks()
+        
+        # Track pending all-reduce operations
+        self._pending_reductions: List[dist.Work] = []
+        
+        # Track which buckets have been reduced (for debugging)
+        self._buckets_reduced = set()
+    
+    def _broadcast_parameters(self):
+        """Broadcast all parameters from rank 0 to all other ranks."""
+        for param in self.module.parameters():
+            dist.broadcast(param.data, src=0)
+    
+    def _create_buckets(self):
+        """
+        Create buckets of parameters in reverse order.
+        
+        Gradients become ready in approximately reverse order of parameters during
+        backward pass, so we bucket in reverse order to trigger communication ASAP.
+        """
+        self.buckets = []  # List of buckets, each bucket is a list of parameters
+        self.bucket_buffers = []  # Pre-allocated buffers for flattened gradients
+        self.param_to_bucket = {}  # Map from parameter to (bucket_idx, offset_in_bucket, numel)
+        
+        bucket_size_bytes = self.bucket_size_mb * 1024 * 1024
+        
+        # Get parameters in reverse order
+        params_with_grad = [p for p in self.module.parameters() if p.requires_grad]
+        params_reversed = list(reversed(params_with_grad))
+        
+        current_bucket = []
+        current_bucket_size = 0
+        
+        for param in params_reversed:
+            param_size = param.numel() * param.element_size()
+            
+            # If adding this parameter would exceed bucket size and bucket is not empty,
+            # start a new bucket
+            if current_bucket_size + param_size > bucket_size_bytes and current_bucket:
+                self.buckets.append(current_bucket)
+                current_bucket = []
+                current_bucket_size = 0
+            
+            current_bucket.append(param)
+            current_bucket_size += param_size
+        
+        # Add the last bucket if not empty
+        if current_bucket:
+            self.buckets.append(current_bucket)
+        
+        # Pre-allocate buffers for each bucket and build param_to_bucket mapping
+        for bucket_idx, bucket in enumerate(self.buckets):
+            total_numel = sum(p.numel() for p in bucket)
+            
+            # Will allocate buffer on first use (need to know dtype and device)
+            self.bucket_buffers.append(None)
+            
+            # Map each parameter to its bucket and offset
+            offset = 0
+            for param in bucket:
+                self.param_to_bucket[param] = (bucket_idx, offset, param.numel())
+                offset += param.numel()
+        
+        # Track which parameters in each bucket have gradients ready
+        self._bucket_grads_ready = [set() for _ in self.buckets]
+    
+    def _register_gradient_hooks(self):
+        """Register hooks to trigger bucket all-reduce when all grads in bucket are ready."""
+        for param in self.module.parameters():
+            if param.requires_grad:
+                param.register_post_accumulate_grad_hook(self._make_bucket_hook(param))
+    
+    def _make_bucket_hook(self, param: nn.Parameter):
+        """
+        Create a hook that checks if a bucket is ready and triggers all-reduce.
+        
+        A bucket is ready when all of its parameters have gradients.
+        """
+        def hook(_param: nn.Parameter):
+            if param.grad is None:
+                return
+            
+            bucket_idx, offset, numel = self.param_to_bucket[param]
+            
+            # Mark this parameter's gradient as ready
+            self._bucket_grads_ready[bucket_idx].add(param)
+            
+            # Check if all parameters in this bucket have gradients ready
+            bucket = self.buckets[bucket_idx]
+            if len(self._bucket_grads_ready[bucket_idx]) == len(bucket):
+                # All gradients in this bucket are ready - trigger all-reduce
+                self._all_reduce_bucket(bucket_idx)
+        
+        return hook
+    
+    def _all_reduce_bucket(self, bucket_idx: int):
+        """
+        All-reduce the gradients for a specific bucket.
+        
+        Flattens the gradients from all parameters in the bucket, issues an
+        async all-reduce, and stores the handle.
+        """
+        if bucket_idx in self._buckets_reduced:
+            # Already reduced this bucket (shouldn't happen, but be safe)
+            return
+        
+        bucket = self.buckets[bucket_idx]
+        
+        # Allocate buffer if needed
+        if self.bucket_buffers[bucket_idx] is None:
+            total_numel = sum(p.numel() for p in bucket)
+            # Use dtype and device from first parameter
+            first_param = bucket[0]
+            self.bucket_buffers[bucket_idx] = torch.empty(
+                total_numel,
+                dtype=first_param.grad.dtype,
+                device=first_param.grad.device
+            )
+        
+        buffer = self.bucket_buffers[bucket_idx]
+        
+        # Flatten gradients into buffer
+        offset = 0
+        for param in bucket:
+            numel = param.grad.numel()
+            buffer[offset:offset + numel].copy_(param.grad.view(-1))
+            offset += numel
+        
+        # Async all-reduce
+        handle = dist.all_reduce(buffer, op=dist.ReduceOp.SUM, async_op=True)
+        self._pending_reductions.append((bucket_idx, handle))
+        self._buckets_reduced.add(bucket_idx)
+    
+    def finish_gradient_synchronization(self):
+        """
+        Wait for all pending gradient reductions and copy results back to parameters.
+        
+        This should be called after the backward pass is complete, but before
+        the optimizer step.
+        """
+        world_size = dist.get_world_size()
+        
+        # Wait for all pending all-reduce operations
+        for bucket_idx, handle in self._pending_reductions:
+            handle.wait()
+            
+            # Copy reduced gradients back to parameters
+            buffer = self.bucket_buffers[bucket_idx]
+            buffer.div_(world_size)
+            
+            bucket = self.buckets[bucket_idx]
+            offset = 0
+            for param in bucket:
+                numel = param.grad.numel()
+                param.grad.copy_(buffer[offset:offset + numel].view_as(param.grad))
+                offset += numel
+        
+        # Clear state for next iteration
+        self._pending_reductions.clear()
+        self._buckets_reduced.clear()
+        for bucket_ready_set in self._bucket_grads_ready:
+            bucket_ready_set.clear()
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass through the wrapped module."""
+        return self.module(*args, **kwargs)
