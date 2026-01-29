@@ -60,59 +60,16 @@ class ShardedOptimizer(Optimizer):
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         
-        # We'll build our own param_groups that will be passed to the parent Optimizer.__init__
-        # These will contain ALL parameters (not just the sharded ones)
-        self.all_param_groups = []
-        
         # Track which parameters belong to which rank
         self.param_to_rank = {}  # maps param -> rank that owns it
         self.owned_params = []  # parameters owned by this rank
         self.owned_param_groups = []  # param groups containing only owned params
-        
-        # Flag to track if we're in initialization (before wrapped_optimizer is created)
-        self._initializing = True
         self.wrapped_optimizer = None
         self.has_params = False
         
-        # Global counter for parameter assignment (to handle multiple param groups)
-        global_param_idx = 0
-        
-        # Process each param group and assign parameters to ranks
-        for group in param_groups:
-            # Make a copy of the group dict
-            group_copy = {k: v for k, v in group.items() if k != 'params'}
-            group_params = list(group['params'])
-            
-            # Add to all_param_groups
-            self.all_param_groups.append({**group_copy, 'params': group_params})
-            
-            # Shard the parameters in this group across ranks
-            owned_params_in_group = []
-            for param in group_params:
-                # Check if this parameter has already been assigned (tied weights)
-                if param not in self.param_to_rank:
-                    # Assign parameter to a rank in round-robin fashion
-                    assigned_rank = global_param_idx % self.world_size
-                    self.param_to_rank[param] = assigned_rank
-                    global_param_idx += 1
-                    
-                    if assigned_rank == self.rank:
-                        self.owned_params.append(param)
-                
-                # Add to owned params if this rank owns it
-                if self.param_to_rank[param] == self.rank:
-                    owned_params_in_group.append(param)
-            
-            # Create param group for owned params
-            if owned_params_in_group:
-                self.owned_param_groups.append({**group_copy, 'params': owned_params_in_group})
-        
-        # Initialize the parent Optimizer class with ALL parameters
-        # This is required so that .param_groups, .state, etc. are properly initialized
-        super().__init__(self.all_param_groups, {})
-        
-        # Now that parent is initialized, create the wrapped optimizer
-        self._initializing = False
+        # Initialize the parent Optimizer class
+        # Parent's __init__ will call self.add_param_group() for each group
+        super().__init__(param_groups, {})
         
         # Create the wrapped optimizer with only the parameters owned by this rank
         if self.owned_param_groups:
@@ -186,12 +143,14 @@ class ShardedOptimizer(Optimizer):
             param_group['params'] = list(params)
         
         # Check for duplicate parameters
-        param_set = set()
-        for group in self.param_groups:
-            param_set.update(set(group['params']))
-        
-        if not param_set.isdisjoint(set(param_group['params'])):
-            raise ValueError("some parameters appear in more than one parameter group")
+        # Note: During __init__, self.param_groups may not exist yet, so we check hasattr
+        if hasattr(self, 'param_groups'):
+            param_set = set()
+            for group in self.param_groups:
+                param_set.update(set(group['params']))
+            
+            if not param_set.isdisjoint(set(param_group['params'])):
+                raise ValueError("some parameters appear in more than one parameter group")
         
         # Assign the new parameters to ranks
         group_params = param_group['params']
@@ -218,13 +177,16 @@ class ShardedOptimizer(Optimizer):
         # Add to parent's param_groups
         super().add_param_group(param_group)
         
-        # Add owned params to the wrapped optimizer (only if it exists, i.e., not during __init__)
-        if owned_params_in_group and not self._initializing:
-            # Create param group for wrapped optimizer with only owned params
+        # Track owned param groups
+        if owned_params_in_group:
             owned_group = {k: v for k, v in param_group.items() if k != 'params'}
             owned_group['params'] = owned_params_in_group
-            self.wrapped_optimizer.add_param_group(owned_group)
-            self.has_params = True
+            self.owned_param_groups.append(owned_group)
+            
+            # Add to wrapped optimizer if it already exists (after __init__)
+            if self.wrapped_optimizer is not None:
+                self.wrapped_optimizer.add_param_group(owned_group)
+                self.has_params = True
     
     def state_dict(self):
         """
