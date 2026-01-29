@@ -29,26 +29,6 @@ class ShardedOptimizer(Optimizer):
     """
     
     def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs: Any):
-        # We need to handle params which could be either an iterable of tensors
-        # or an iterable of dicts (param groups)
-        
-        # First, collect all param groups
-        if isinstance(params, torch.Tensor):
-            raise TypeError("params should be an iterable of Tensors or dicts")
-        
-        # Convert params to a list to process them
-        params_list = list(params)
-        
-        if len(params_list) == 0:
-            raise ValueError("optimizer got an empty parameter list")
-        
-        # Check if we have param groups (dicts) or just tensors
-        if isinstance(params_list[0], dict):
-            param_groups = params_list
-        else:
-            # Just tensors, create a single param group
-            param_groups = [{'params': params_list}]
-        
         # Store the optimizer class and kwargs for later use
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = kwargs
@@ -68,8 +48,8 @@ class ShardedOptimizer(Optimizer):
         self.has_params = False
         
         # Initialize the parent Optimizer class
-        # Parent's __init__ will call self.add_param_group() for each group
-        super().__init__(param_groups, {})
+        # Parent's __init__ will normalize params and call self.add_param_group() for each group
+        super().__init__(params, {})
         
         # Create the wrapped optimizer with only the parameters owned by this rank
         if self.owned_param_groups:
@@ -124,41 +104,23 @@ class ShardedOptimizer(Optimizer):
         """
         Add a parameter group to the optimizer.
         
-        This method is called by the parent Optimizer.__init__ and may also be
-        called during training (e.g., for gradually unfreezing layers).
+        This method is called by the parent Optimizer.__init__ during initialization.
         
         Args:
             param_group: A dict containing parameters and optimization options
         """
-        if not isinstance(param_group, dict):
-            raise TypeError("param_group must be a dict")
+        # Let parent handle validation, normalization, duplicate checking, and adding to param_groups
+        # Note: parent modifies param_group in place (normalizes params, adds defaults)
+        super().add_param_group(param_group)
         
-        params = param_group['params']
-        if isinstance(params, torch.Tensor):
-            param_group['params'] = [params]
-        elif isinstance(params, set):
-            raise TypeError('optimizer parameters need to be organized in ordered collections, but '
-                            'the ordering of tensors in sets will change between runs. Please use a list instead.')
-        else:
-            param_group['params'] = list(params)
-        
-        # Check for duplicate parameters
-        # Note: During __init__, self.param_groups may not exist yet, so we check hasattr
-        if hasattr(self, 'param_groups'):
-            param_set = set()
-            for group in self.param_groups:
-                param_set.update(set(group['params']))
-            
-            if not param_set.isdisjoint(set(param_group['params'])):
-                raise ValueError("some parameters appear in more than one parameter group")
-        
-        # Assign the new parameters to ranks
+        # Use the normalized param_group (parent modified it in place)
         group_params = param_group['params']
         owned_params_in_group = []
         
         # Get current number of unique assigned parameters to continue round-robin
         current_param_count = len(self.param_to_rank)
         
+        # Assign the new parameters to ranks
         for param in group_params:
             # Check if this parameter has already been assigned (tied weights)
             if param not in self.param_to_rank:
@@ -174,19 +136,11 @@ class ShardedOptimizer(Optimizer):
             if self.param_to_rank[param] == self.rank:
                 owned_params_in_group.append(param)
         
-        # Add to parent's param_groups
-        super().add_param_group(param_group)
-        
-        # Track owned param groups
+        # Track owned param groups for later wrapped optimizer creation
         if owned_params_in_group:
             owned_group = {k: v for k, v in param_group.items() if k != 'params'}
             owned_group['params'] = owned_params_in_group
             self.owned_param_groups.append(owned_group)
-            
-            # Add to wrapped optimizer if it already exists (after __init__)
-            if self.wrapped_optimizer is not None:
-                self.wrapped_optimizer.add_param_group(owned_group)
-                self.has_params = True
     
     def state_dict(self):
         """
